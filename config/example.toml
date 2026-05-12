@@ -1,0 +1,31 @@
+[particles]
+count = 3000
+# Physics collision radius (world units). Determines when two particles bounce off each other
+# and how close they get to the box walls.
+radius = 0.03
+mass = 1.0
+speed = 1.0
+
+[box]
+min = [0.0, 0.0, 0.0]
+max = [2.0, 2.0, 2.0]
+
+[sim]
+dt = 0.005
+steps = 2000
+seed = 42
+report_every = 200
+
+[view]
+# Rendered dot diameter on screen (pixels), independent of physics radius above.
+# Setting this much smaller than the physics radius gives a "see the centers" look —
+# you see each particle's location, but the dot doesn't obstruct particles behind it.
+particle_pixel_size = 3.0
+color_mode = "velocity"     # "velocity" or "uniform"
+subsample = 1               # render every Nth particle (1 = all)
+color = [0.95, 0.55, 0.15]  # warm end of the velocity ramp; also used in uniform mode
+# Uncomment to render only a cross-section slab along one axis:
+# [view.slice]
+# axis = "z"
+# min = 0.8
+# max = 1.2

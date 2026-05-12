@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/physics-core", "crates/physics-sim", "crates/physics-viewer"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+
+[workspace.dependencies]
+glam = "0.29"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+rand = "0.8"
+rand_xoshiro = "0.6"
+anyhow = "1"
+wgpu = "22"
+winit = "0.30"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"

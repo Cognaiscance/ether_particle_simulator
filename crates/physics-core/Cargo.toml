@@ -1,0 +1,10 @@
+[package]
+name = "physics-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+rand = { workspace = true }
+rand_xoshiro = { workspace = true }
