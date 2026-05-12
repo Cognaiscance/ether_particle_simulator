@@ -68,6 +68,10 @@ struct ViewConfig {
     /// Color used in `Uniform` mode and as the warm end of `Velocity`.
     #[serde(default = "default_color")]
     color: [f32; 3],
+    /// 0 = every particle the same size on screen; 1 = closer particles drawn bigger
+    /// (full perspective). Values in between give subtle depth cues.
+    #[serde(default = "default_depth_scale")]
+    depth_scale: f32,
 }
 
 impl Default for ViewConfig {
@@ -78,6 +82,7 @@ impl Default for ViewConfig {
             subsample: one(),
             slice: None,
             color: default_color(),
+            depth_scale: default_depth_scale(),
         }
     }
 }
@@ -85,6 +90,7 @@ impl Default for ViewConfig {
 fn default_pixel_size() -> f32 { 6.0 }
 fn one() -> usize { 1 }
 fn default_color() -> [f32; 3] { [0.9, 0.6, 0.2] }
+fn default_depth_scale() -> f32 { 0.0 }
 
 #[derive(Deserialize, Default, Copy, Clone)]
 #[serde(rename_all = "snake_case")]
@@ -211,6 +217,7 @@ impl ApplicationHandler for App {
         let renderer = pollster::block_on(Renderer::new(
             window.clone(),
             self.cfg.view.particle_pixel_size,
+            self.cfg.view.depth_scale,
         ))
         .expect("init renderer");
         self.renderer = Some(renderer);

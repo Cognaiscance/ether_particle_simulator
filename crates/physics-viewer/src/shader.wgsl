@@ -1,6 +1,8 @@
 struct Camera {
     view_proj: mat4x4<f32>,
-    // xy: 2*pixel_size/screen_size (NDC offset per quad corner). zw unused.
+    // xy: 2*pixel_size/screen_size (NDC offset per quad corner).
+    // z: depth_scale in [0,1] — 0 = constant pixel size, 1 = fully perspective-correct (1/depth).
+    // w: unused.
     px_size: vec4<f32>,
 };
 
@@ -24,9 +26,10 @@ struct VertexOutput {
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     let center_clip = camera.view_proj * vec4<f32>(in.world_pos, 1.0);
-    // Multiplying NDC offset by w cancels the perspective divide so the billboard stays a fixed
-    // pixel size on screen regardless of depth — simplest behavior for visualizing dense clouds.
-    let offset = vec4<f32>(in.quad * camera.px_size.xy, 0.0, 0.0) * center_clip.w;
+    // Blend between constant-pixel-size (multiply by w to cancel perspective divide) and
+    // perspective-correct (multiply by 1, so /w stays in NDC and far things shrink).
+    let w_factor = mix(center_clip.w, 1.0, camera.px_size.z);
+    let offset = vec4<f32>(in.quad * camera.px_size.xy, 0.0, 0.0) * w_factor;
     out.clip = center_clip + offset;
     out.quad = in.quad;
     out.color = in.color;

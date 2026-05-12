@@ -42,10 +42,11 @@ pub struct Renderer {
     camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     particle_pixel_size: f32,
+    depth_scale: f32,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, particle_pixel_size: f32) -> Result<Self> {
+    pub async fn new(window: Arc<Window>, particle_pixel_size: f32, depth_scale: f32) -> Result<Self> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -236,6 +237,7 @@ impl Renderer {
             camera_bind_group,
             depth_view,
             particle_pixel_size,
+            depth_scale: depth_scale.clamp(0.0, 1.0),
         })
     }
 
@@ -261,7 +263,7 @@ impl Renderer {
             px_size: [
                 2.0 * px / self.size.width.max(1) as f32,
                 2.0 * px / self.size.height.max(1) as f32,
-                0.0,
+                self.depth_scale,
                 0.0,
             ],
         };

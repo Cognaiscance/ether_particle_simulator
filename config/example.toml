@@ -24,6 +24,7 @@ particle_pixel_size = 3.0
 color_mode = "velocity"     # "velocity" or "uniform"
 subsample = 1               # render every Nth particle (1 = all)
 color = [0.95, 0.55, 0.15]  # warm end of the velocity ramp; also used in uniform mode
+depth_scale = 0.3           # 0 = flat (constant pixel size), 1 = full perspective
 # Uncomment to render only a cross-section slab along one axis:
 # [view.slice]
 # axis = "z"
