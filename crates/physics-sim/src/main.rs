@@ -2,14 +2,16 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, Context, Result};
 use glam::Vec3;
-use physics_core::{init_random_uniform_speed, Simulation, SimulationParams};
+use physics_core::{init_random_uniform_speed, Domain, Simulation, SimulationParams};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Config {
     particles: ParticlesConfig,
-    #[serde(rename = "box")]
-    box_: BoxConfig,
+    #[serde(rename = "box", default)]
+    box_: Option<BoxConfig>,
+    #[serde(default)]
+    sphere: Option<SphereConfig>,
     sim: SimConfig,
 }
 
@@ -25,6 +27,12 @@ struct ParticlesConfig {
 struct BoxConfig {
     min: [f32; 3],
     max: [f32; 3],
+}
+
+#[derive(Deserialize)]
+struct SphereConfig {
+    center: [f32; 3],
+    radius: f32,
 }
 
 #[derive(Deserialize)]
@@ -46,11 +54,22 @@ fn main() -> Result<()> {
     let cfg: Config = toml::from_str(&raw)
         .with_context(|| format!("parsing config {}", config_path.display()))?;
 
+    let domain = match (cfg.box_.as_ref(), cfg.sphere.as_ref()) {
+        (Some(b), None) => Domain::Box {
+            min: Vec3::from_array(b.min),
+            max: Vec3::from_array(b.max),
+        },
+        (None, Some(s)) => Domain::Sphere {
+            center: Vec3::from_array(s.center),
+            radius: s.radius,
+        },
+        (Some(_), Some(_)) => return Err(anyhow!("config must specify either [box] or [sphere], not both")),
+        (None, None) => return Err(anyhow!("config must specify [box] or [sphere]")),
+    };
     let params = SimulationParams {
         radius: cfg.particles.radius,
         mass: cfg.particles.mass,
-        box_min: Vec3::from_array(cfg.box_.min),
-        box_max: Vec3::from_array(cfg.box_.max),
+        domain,
     };
 
     let (positions, velocities) = init_random_uniform_speed(

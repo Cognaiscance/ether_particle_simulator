@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use glam::Vec3;
-use physics_core::{init_random_uniform_speed, Simulation, SimulationParams};
+use physics_core::{init_random_uniform_speed, Domain, Simulation, SimulationParams};
 use serde::Deserialize;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -20,8 +20,10 @@ use crate::renderer::{Instance, Renderer};
 #[derive(Deserialize)]
 struct Config {
     particles: ParticlesConfig,
-    #[serde(rename = "box")]
-    box_: BoxConfig,
+    #[serde(rename = "box", default)]
+    box_: Option<BoxConfig>,
+    #[serde(default)]
+    sphere: Option<SphereConfig>,
     sim: SimConfig,
     #[serde(default)]
     view: ViewConfig,
@@ -39,6 +41,12 @@ struct ParticlesConfig {
 struct BoxConfig {
     min: [f32; 3],
     max: [f32; 3],
+}
+
+#[derive(Deserialize)]
+struct SphereConfig {
+    center: [f32; 3],
+    radius: f32,
 }
 
 #[derive(Deserialize)]
@@ -139,11 +147,22 @@ struct App {
 
 impl App {
     fn new(cfg: Config) -> Result<Self> {
+        let domain = match (cfg.box_.as_ref(), cfg.sphere.as_ref()) {
+            (Some(b), None) => Domain::Box {
+                min: Vec3::from_array(b.min),
+                max: Vec3::from_array(b.max),
+            },
+            (None, Some(s)) => Domain::Sphere {
+                center: Vec3::from_array(s.center),
+                radius: s.radius,
+            },
+            (Some(_), Some(_)) => return Err(anyhow!("config must specify either [box] or [sphere], not both")),
+            (None, None) => return Err(anyhow!("config must specify [box] or [sphere]")),
+        };
         let params = SimulationParams {
             radius: cfg.particles.radius,
             mass: cfg.particles.mass,
-            box_min: Vec3::from_array(cfg.box_.min),
-            box_max: Vec3::from_array(cfg.box_.max),
+            domain,
         };
         let (positions, velocities) = init_random_uniform_speed(
             cfg.particles.count,
@@ -153,7 +172,8 @@ impl App {
         )
         .ok_or_else(|| anyhow!("could not place {} particles without overlap", cfg.particles.count))?;
         let sim = Simulation::new(params, positions, velocities);
-        let camera = OrbitCamera::looking_at_box(params.box_min, params.box_max);
+        let (aabb_min, aabb_max) = params.domain.aabb();
+        let camera = OrbitCamera::looking_at_box(aabb_min, aabb_max);
         Ok(Self {
             speed_for_color: cfg.particles.speed,
             cfg,

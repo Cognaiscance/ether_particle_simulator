@@ -7,12 +7,73 @@ use rayon::prelude::*;
 mod grid;
 use grid::HashGrid;
 
+/// Shape of the simulation domain. Walls are inside-facing — particles bounce off them.
+#[derive(Clone, Copy, Debug)]
+pub enum Domain {
+    Box { min: Vec3, max: Vec3 },
+    Sphere { center: Vec3, radius: f32 },
+}
+
+impl Domain {
+    /// AABB of the domain (used to size the hash grid, frame the camera, etc.).
+    pub fn aabb(&self) -> (Vec3, Vec3) {
+        match *self {
+            Domain::Box { min, max } => (min, max),
+            Domain::Sphere { center, radius } => (
+                center - Vec3::splat(radius),
+                center + Vec3::splat(radius),
+            ),
+        }
+    }
+
+    /// Region in which particle centers can legally sit (accounting for particle radius).
+    fn particle_aabb(&self, r: f32) -> (Vec3, Vec3) {
+        match *self {
+            Domain::Box { min, max } => (min + Vec3::splat(r), max - Vec3::splat(r)),
+            Domain::Sphere { center, radius } => {
+                let inner = radius - r;
+                (center - Vec3::splat(inner), center + Vec3::splat(inner))
+            }
+        }
+    }
+
+    /// Volume of the region in which particle centers can legally sit.
+    fn particle_volume(&self, r: f32) -> f32 {
+        match *self {
+            Domain::Box { min, max } => {
+                let usable = (max - min) - Vec3::splat(2.0 * r);
+                (usable.x * usable.y * usable.z).max(0.0)
+            }
+            Domain::Sphere { radius, .. } => {
+                let inner = (radius - r).max(0.0);
+                (4.0 / 3.0) * std::f32::consts::PI * inner * inner * inner
+            }
+        }
+    }
+
+    /// Whether a particle center at `p` lies inside the wall-respecting interior.
+    fn contains_center(&self, p: Vec3, r: f32) -> bool {
+        match *self {
+            Domain::Box { min, max } => {
+                let lo = min + Vec3::splat(r);
+                let hi = max - Vec3::splat(r);
+                p.x >= lo.x && p.x <= hi.x
+                    && p.y >= lo.y && p.y <= hi.y
+                    && p.z >= lo.z && p.z <= hi.z
+            }
+            Domain::Sphere { center, radius } => {
+                let inner = radius - r;
+                (p - center).length_squared() <= inner * inner
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SimulationParams {
     pub radius: f32,
     pub mass: f32,
-    pub box_min: Vec3,
-    pub box_max: Vec3,
+    pub domain: Domain,
 }
 
 pub struct Simulation {
@@ -51,16 +112,40 @@ impl Simulation {
 
     fn resolve_walls(&mut self) {
         let r = self.params.radius;
-        let lo = self.params.box_min + Vec3::splat(r);
-        let hi = self.params.box_max - Vec3::splat(r);
-        for (p, v) in self.positions.iter_mut().zip(self.velocities.iter_mut()) {
-            for axis in 0..3 {
-                if p[axis] < lo[axis] {
-                    p[axis] = lo[axis] + (lo[axis] - p[axis]);
-                    v[axis] = -v[axis];
-                } else if p[axis] > hi[axis] {
-                    p[axis] = hi[axis] - (p[axis] - hi[axis]);
-                    v[axis] = -v[axis];
+        match self.params.domain {
+            Domain::Box { min, max } => {
+                let lo = min + Vec3::splat(r);
+                let hi = max - Vec3::splat(r);
+                for (p, v) in self.positions.iter_mut().zip(self.velocities.iter_mut()) {
+                    for axis in 0..3 {
+                        if p[axis] < lo[axis] {
+                            p[axis] = lo[axis] + (lo[axis] - p[axis]);
+                            v[axis] = -v[axis];
+                        } else if p[axis] > hi[axis] {
+                            p[axis] = hi[axis] - (p[axis] - hi[axis]);
+                            v[axis] = -v[axis];
+                        }
+                    }
+                }
+            }
+            Domain::Sphere { center, radius } => {
+                let inner = radius - r;
+                let inner_sq = inner * inner;
+                for (p, v) in self.positions.iter_mut().zip(self.velocities.iter_mut()) {
+                    let offset = *p - center;
+                    let d_sq = offset.length_squared();
+                    if d_sq > inner_sq && d_sq > 1e-12 {
+                        let d = d_sq.sqrt();
+                        let n_hat = offset / d;
+                        // Mirror position across the wall so the particle re-enters by the
+                        // amount it overshot.
+                        *p -= n_hat * (2.0 * (d - inner));
+                        // Reflect the outward-going component of velocity.
+                        let v_rad = v.dot(n_hat);
+                        if v_rad > 0.0 {
+                            *v -= 2.0 * v_rad * n_hat;
+                        }
+                    }
                 }
             }
         }
@@ -144,8 +229,8 @@ pub fn init_random_uniform_speed(
     seed: u64,
 ) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
     let r = params.radius;
-    let extent = params.box_max - params.box_min;
-    let usable = extent - Vec3::splat(2.0 * r);
+    let (aabb_lo, aabb_hi) = params.domain.particle_aabb(r);
+    let usable = aabb_hi - aabb_lo;
     if usable.min_element() <= 0.0 {
         return None;
     }
@@ -154,53 +239,57 @@ pub fn init_random_uniform_speed(
     }
 
     // Place particles on an FCC lattice (max sphere packing fraction ≈ 0.7405). Reaches
-    // dense configurations that random rejection sampling can't.
+    // dense configurations that random rejection sampling can't. Lattice points outside
+    // the actual domain (e.g. corners of the AABB for a sphere) are filtered out.
     //
     // For lattice constant `a`, the 12 nearest neighbors in FCC are at distance `a / √2`.
     // We require `a / √2 ≥ 2r` so spheres don't overlap.
-    let v_usable = usable.x * usable.y * usable.z;
+    let v_domain = params.domain.particle_volume(r);
+    if v_domain <= 0.0 {
+        return None;
+    }
     let min_spacing = 2.0 * std::f32::consts::SQRT_2 * r;
-    let mut a = (4.0 * v_usable / n as f32).cbrt();
-    let mut nx: i32 = 0;
-    let mut ny: i32 = 0;
-    let mut nz: i32 = 0;
+    let mut a = (4.0 * v_domain / n as f32).cbrt();
+
+    let mut positions: Vec<Vec3> = Vec::with_capacity(n);
     loop {
         if a < min_spacing {
-            return None; // can't fit N non-overlapping spheres at any FCC spacing in this box
+            return None; // can't fit N non-overlapping spheres at any FCC spacing
         }
-        nx = (usable.x / a).floor() as i32;
-        ny = (usable.y / a).floor() as i32;
-        nz = (usable.z / a).floor() as i32;
-        let count = 4i64 * (nx as i64) * (ny as i64) * (nz as i64);
-        if count >= n as i64 {
-            break;
-        }
-        // Floor losses cost us a few positions; shrink and retry. Converges in O(log).
-        a *= 0.98;
-    }
-
-    let basis = [
-        Vec3::new(0.0, 0.0, 0.0),
-        Vec3::new(0.5, 0.5, 0.0) * a,
-        Vec3::new(0.5, 0.0, 0.5) * a,
-        Vec3::new(0.0, 0.5, 0.5) * a,
-    ];
-    let origin = params.box_min + Vec3::splat(r);
-    let mut positions: Vec<Vec3> = Vec::with_capacity(n);
-    'outer: for k in 0..nz {
-        let z = origin.z + (k as f32) * a;
-        for j in 0..ny {
-            let y = origin.y + (j as f32) * a;
-            for i in 0..nx {
-                let x = origin.x + (i as f32) * a;
-                for &off in &basis {
-                    positions.push(Vec3::new(x, y, z) + off);
-                    if positions.len() == n {
-                        break 'outer;
+        positions.clear();
+        let nx = (usable.x / a).floor() as i32;
+        let ny = (usable.y / a).floor() as i32;
+        let nz = (usable.z / a).floor() as i32;
+        let basis = [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(0.5, 0.5, 0.0) * a,
+            Vec3::new(0.5, 0.0, 0.5) * a,
+            Vec3::new(0.0, 0.5, 0.5) * a,
+        ];
+        'outer: for k in 0..nz {
+            let z = aabb_lo.z + (k as f32) * a;
+            for j in 0..ny {
+                let y = aabb_lo.y + (j as f32) * a;
+                for i in 0..nx {
+                    let x = aabb_lo.x + (i as f32) * a;
+                    for &off in &basis {
+                        let p = Vec3::new(x, y, z) + off;
+                        if params.domain.contains_center(p, r) {
+                            positions.push(p);
+                            if positions.len() == n {
+                                break 'outer;
+                            }
+                        }
                     }
                 }
             }
         }
+        if positions.len() == n {
+            break;
+        }
+        // Either the lattice was too coarse (cube floors lost positions) or the domain
+        // discards too many points (sphere corners). Shrink `a` and retry.
+        a *= 0.98;
     }
 
     // Jitter, bounded so the FCC nearest-neighbor distance can't drop below 2r.
@@ -256,8 +345,7 @@ mod tests {
         SimulationParams {
             radius: 0.05,
             mass: 1.0,
-            box_min: Vec3::ZERO,
-            box_max: Vec3::splat(2.0),
+            domain: Domain::Box { min: Vec3::ZERO, max: Vec3::splat(2.0) },
         }
     }
 
@@ -286,13 +374,11 @@ mod tests {
         let params = SimulationParams {
             radius: 0.05,
             mass: 1.0,
-            box_min: Vec3::splat(-100.0),
-            box_max: Vec3::splat(100.0),
+            domain: Domain::Box { min: Vec3::splat(-100.0), max: Vec3::splat(100.0) },
         };
         // Place particles in a tight cluster so they actually collide.
         let small_params = SimulationParams {
-            box_min: Vec3::splat(-0.5),
-            box_max: Vec3::splat(0.5),
+            domain: Domain::Box { min: Vec3::splat(-0.5), max: Vec3::splat(0.5) },
             ..params
         };
         let (positions, velocities) = init_random_uniform_speed(20, small_params, 1.0, 7).unwrap();
@@ -315,13 +401,34 @@ mod tests {
     }
 
     #[test]
+    fn sphere_walls_conserve_energy_and_keep_particles_inside() {
+        let params = SimulationParams {
+            radius: 0.02,
+            mass: 1.0,
+            domain: Domain::Sphere { center: Vec3::splat(1.0), radius: 1.0 },
+        };
+        let (positions, velocities) = init_random_uniform_speed(50, params, 1.0, 11).unwrap();
+        let mut sim = Simulation::new(params, positions, velocities);
+        let e0 = sim.kinetic_energy();
+        for _ in 0..2000 {
+            sim.step(0.005);
+        }
+        let e1 = sim.kinetic_energy();
+        assert!((e1 - e0).abs() / e0 < 1e-3, "energy drift: {} -> {}", e0, e1);
+        // No particle should have leaked out (allowing a small numerical slack).
+        for p in &sim.positions {
+            let d = (*p - Vec3::splat(1.0)).length();
+            assert!(d <= 1.0 - 0.02 + 1e-4, "particle at distance {} from center", d);
+        }
+    }
+
+    #[test]
     fn head_on_equal_mass_swaps_velocities() {
         // Two particles on the x-axis moving toward each other; they should swap velocities.
         let params = SimulationParams {
             radius: 0.1,
             mass: 1.0,
-            box_min: Vec3::splat(-10.0),
-            box_max: Vec3::splat(10.0),
+            domain: Domain::Box { min: Vec3::splat(-10.0), max: Vec3::splat(10.0) },
         };
         let positions = vec![Vec3::new(-0.15, 0.0, 0.0), Vec3::new(0.15, 0.0, 0.0)];
         let velocities = vec![Vec3::new(1.0, 0.0, 0.0), Vec3::new(-1.0, 0.0, 0.0)];
