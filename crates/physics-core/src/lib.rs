@@ -2,6 +2,10 @@ use glam::Vec3;
 use rand::Rng;
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
+use rayon::prelude::*;
+
+mod grid;
+use grid::HashGrid;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SimulationParams {
@@ -15,12 +19,14 @@ pub struct Simulation {
     pub params: SimulationParams,
     pub positions: Vec<Vec3>,
     pub velocities: Vec<Vec3>,
+    grid: HashGrid,
 }
 
 impl Simulation {
     pub fn new(params: SimulationParams, positions: Vec<Vec3>, velocities: Vec<Vec3>) -> Self {
         assert_eq!(positions.len(), velocities.len());
-        Self { params, positions, velocities }
+        let grid = HashGrid::new(2.0 * params.radius);
+        Self { params, positions, velocities, grid }
     }
 
     pub fn len(&self) -> usize {
@@ -63,34 +69,55 @@ impl Simulation {
     fn resolve_pairs(&mut self) {
         let n = self.positions.len();
         let r = self.params.radius;
-        let m = self.params.mass;
         let min_dist = 2.0 * r;
         let min_dist_sq = min_dist * min_dist;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let delta = self.positions[j] - self.positions[i];
-                let dist_sq = delta.length_squared();
-                if dist_sq >= min_dist_sq || dist_sq == 0.0 {
-                    continue;
-                }
-                let dist = dist_sq.sqrt();
-                let n_hat = delta / dist;
-                let v_rel = self.velocities[i] - self.velocities[j];
-                let approach = v_rel.dot(n_hat);
-                if approach > 0.0 {
-                    // Equal-mass elastic: swap the normal component.
-                    let _ = m; // mass currently unused (equal masses); kept for future per-particle mass.
-                    let impulse = approach * n_hat;
-                    self.velocities[i] -= impulse;
-                    self.velocities[j] += impulse;
-                }
-                // Positional de-overlap, split evenly along the normal.
-                let overlap = min_dist - dist;
-                if overlap > 0.0 {
-                    let push = 0.5 * overlap * n_hat;
-                    self.positions[i] -= push;
-                    self.positions[j] += push;
-                }
+
+        // Broad phase via uniform grid: per particle, only test the 3x3x3 cell neighborhood
+        // instead of all (i, j>i) pairs. Pair-list collection parallelizes across cores; the
+        // resolve step stays serial so per-pair impulse is computed from the live state.
+        self.grid.rebuild(&self.positions);
+        let positions = &self.positions;
+        let grid = &self.grid;
+        let mut pairs: Vec<(usize, usize)> = (0..n)
+            .into_par_iter()
+            .flat_map_iter(|i| {
+                let pos_i = positions[i];
+                let mut out: Vec<(usize, usize)> = Vec::new();
+                grid.for_each_neighbor(pos_i, |j| {
+                    if j > i {
+                        let delta = positions[j] - pos_i;
+                        let dist_sq = delta.length_squared();
+                        if dist_sq < min_dist_sq && dist_sq > 0.0 {
+                            out.push((i, j));
+                        }
+                    }
+                });
+                out.into_iter()
+            })
+            .collect();
+        pairs.sort_unstable();
+
+        for (i, j) in pairs {
+            let delta = self.positions[j] - self.positions[i];
+            let dist_sq = delta.length_squared();
+            if dist_sq >= min_dist_sq || dist_sq == 0.0 {
+                // Earlier resolved pair already separated these; nothing to do.
+                continue;
+            }
+            let dist = dist_sq.sqrt();
+            let n_hat = delta / dist;
+            let v_rel = self.velocities[i] - self.velocities[j];
+            let approach = v_rel.dot(n_hat);
+            if approach > 0.0 {
+                let impulse = approach * n_hat;
+                self.velocities[i] -= impulse;
+                self.velocities[j] += impulse;
+            }
+            let overlap = min_dist - dist;
+            if overlap > 0.0 {
+                let push = 0.5 * overlap * n_hat;
+                self.positions[i] -= push;
+                self.positions[j] += push;
             }
         }
     }
@@ -117,29 +144,79 @@ pub fn init_random_uniform_speed(
     seed: u64,
 ) -> Option<(Vec<Vec3>, Vec<Vec3>)> {
     let r = params.radius;
-    let lo = params.box_min + Vec3::splat(r);
-    let hi = params.box_max - Vec3::splat(r);
-    if (hi - lo).min_element() <= 0.0 {
+    let extent = params.box_max - params.box_min;
+    let usable = extent - Vec3::splat(2.0 * r);
+    if usable.min_element() <= 0.0 {
         return None;
     }
-    let min_dist_sq = (2.0 * r) * (2.0 * r);
+    if n == 0 {
+        return Some((Vec::new(), Vec::new()));
+    }
 
-    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-    let mut positions: Vec<Vec3> = Vec::with_capacity(n);
-    let max_attempts = 200 * n.max(1);
-    let mut attempts = 0;
-    while positions.len() < n {
-        if attempts >= max_attempts {
-            return None;
+    // Place particles on an FCC lattice (max sphere packing fraction ≈ 0.7405). Reaches
+    // dense configurations that random rejection sampling can't.
+    //
+    // For lattice constant `a`, the 12 nearest neighbors in FCC are at distance `a / √2`.
+    // We require `a / √2 ≥ 2r` so spheres don't overlap.
+    let v_usable = usable.x * usable.y * usable.z;
+    let min_spacing = 2.0 * std::f32::consts::SQRT_2 * r;
+    let mut a = (4.0 * v_usable / n as f32).cbrt();
+    let mut nx: i32 = 0;
+    let mut ny: i32 = 0;
+    let mut nz: i32 = 0;
+    loop {
+        if a < min_spacing {
+            return None; // can't fit N non-overlapping spheres at any FCC spacing in this box
         }
-        attempts += 1;
-        let candidate = Vec3::new(
-            rng.gen_range(lo.x..hi.x),
-            rng.gen_range(lo.y..hi.y),
-            rng.gen_range(lo.z..hi.z),
-        );
-        if positions.iter().all(|p| (*p - candidate).length_squared() >= min_dist_sq) {
-            positions.push(candidate);
+        nx = (usable.x / a).floor() as i32;
+        ny = (usable.y / a).floor() as i32;
+        nz = (usable.z / a).floor() as i32;
+        let count = 4i64 * (nx as i64) * (ny as i64) * (nz as i64);
+        if count >= n as i64 {
+            break;
+        }
+        // Floor losses cost us a few positions; shrink and retry. Converges in O(log).
+        a *= 0.98;
+    }
+
+    let basis = [
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(0.5, 0.5, 0.0) * a,
+        Vec3::new(0.5, 0.0, 0.5) * a,
+        Vec3::new(0.0, 0.5, 0.5) * a,
+    ];
+    let origin = params.box_min + Vec3::splat(r);
+    let mut positions: Vec<Vec3> = Vec::with_capacity(n);
+    'outer: for k in 0..nz {
+        let z = origin.z + (k as f32) * a;
+        for j in 0..ny {
+            let y = origin.y + (j as f32) * a;
+            for i in 0..nx {
+                let x = origin.x + (i as f32) * a;
+                for &off in &basis {
+                    positions.push(Vec3::new(x, y, z) + off);
+                    if positions.len() == n {
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    // Jitter, bounded so the FCC nearest-neighbor distance can't drop below 2r.
+    // Two neighbors can each jitter by up to magnitude J = (a/√2 - 2r) / 2; with per-axis
+    // uniform jitter ±K, total magnitude ≤ K√3, so K = J/√3. A 0.9 safety factor avoids
+    // grazing contact.
+    let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
+    let jitter_axis =
+        ((a / std::f32::consts::SQRT_2 - 2.0 * r) / (2.0 * 3f32.sqrt())) * 0.9;
+    if jitter_axis > 0.0 {
+        for p in positions.iter_mut() {
+            *p += Vec3::new(
+                rng.gen_range(-jitter_axis..jitter_axis),
+                rng.gen_range(-jitter_axis..jitter_axis),
+                rng.gen_range(-jitter_axis..jitter_axis),
+            );
         }
     }
 
