@@ -59,4 +59,13 @@ impl OrbitCamera {
         let proj = Mat4::perspective_rh(self.fov_y, aspect, self.znear, self.zfar);
         proj * view
     }
+
+    /// Diagonal entries of the perspective projection: `[proj[0][0], proj[1][1]]`.
+    /// A view-space offset of `r` along x/y maps to a clip-space offset of
+    /// `proj_scale * r` along the same axes, before the perspective divide. Used by the
+    /// renderer to size world-space billboards correctly without exposing the full proj.
+    pub fn proj_scale(&self, aspect: f32) -> [f32; 2] {
+        let cot_half_fov = 1.0 / (self.fov_y * 0.5).tan();
+        [cot_half_fov / aspect, cot_half_fov]
+    }
 }

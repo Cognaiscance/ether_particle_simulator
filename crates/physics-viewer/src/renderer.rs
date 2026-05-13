@@ -43,10 +43,16 @@ pub struct Renderer {
     depth_view: wgpu::TextureView,
     particle_pixel_size: f32,
     depth_scale: f32,
+    world_radius: Option<f32>,
 }
 
 impl Renderer {
-    pub async fn new(window: Arc<Window>, particle_pixel_size: f32, depth_scale: f32) -> Result<Self> {
+    pub async fn new(
+        window: Arc<Window>,
+        particle_pixel_size: f32,
+        depth_scale: f32,
+        world_radius: Option<f32>,
+    ) -> Result<Self> {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -238,6 +244,7 @@ impl Renderer {
             depth_view,
             particle_pixel_size,
             depth_scale: depth_scale.clamp(0.0, 1.0),
+            world_radius,
         })
     }
 
@@ -256,16 +263,27 @@ impl Renderer {
         self.size.width as f32 / self.size.height.max(1) as f32
     }
 
-    pub fn update_camera(&self, view_proj: glam::Mat4) {
-        let px = self.particle_pixel_size;
+    pub fn update_camera(&self, view_proj: glam::Mat4, proj_xy: [f32; 2]) {
+        // World-space mode: clip-space offset for a world radius `r` along view-space x/y
+        // is `proj_xy * r` (before the perspective divide), so the rendered dot diameter
+        // matches the physics collision sphere and shrinks naturally with distance.
+        // Pixel mode keeps the existing constant-on-screen behaviour, modulated by depth_scale.
+        let (px_xy, depth_scale) = match self.world_radius {
+            Some(r) => ([proj_xy[0] * r, proj_xy[1] * r], 1.0),
+            None => {
+                let px = self.particle_pixel_size;
+                (
+                    [
+                        2.0 * px / self.size.width.max(1) as f32,
+                        2.0 * px / self.size.height.max(1) as f32,
+                    ],
+                    self.depth_scale,
+                )
+            }
+        };
         let uniform = CameraUniform {
             view_proj: view_proj.to_cols_array_2d(),
-            px_size: [
-                2.0 * px / self.size.width.max(1) as f32,
-                2.0 * px / self.size.height.max(1) as f32,
-                self.depth_scale,
-                0.0,
-            ],
+            px_size: [px_xy[0], px_xy[1], depth_scale, 0.0],
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&uniform));

@@ -72,6 +72,11 @@ struct ViewConfig {
     /// (full perspective). Values in between give subtle depth cues.
     #[serde(default = "default_depth_scale")]
     depth_scale: f32,
+    /// When true, ignore `particle_pixel_size` and draw each dot as a world-space billboard
+    /// matching the physics radius — the rendered size shrinks naturally with distance and
+    /// corresponds to the actual collision sphere.
+    #[serde(default)]
+    render_at_physical_size: bool,
 }
 
 impl Default for ViewConfig {
@@ -83,6 +88,7 @@ impl Default for ViewConfig {
             slice: None,
             color: default_color(),
             depth_scale: default_depth_scale(),
+            render_at_physical_size: false,
         }
     }
 }
@@ -214,10 +220,16 @@ impl ApplicationHandler for App {
                 .create_window(attrs)
                 .expect("create window"),
         );
+        let world_radius = if self.cfg.view.render_at_physical_size {
+            Some(self.cfg.particles.radius)
+        } else {
+            None
+        };
         let renderer = pollster::block_on(Renderer::new(
             window.clone(),
             self.cfg.view.particle_pixel_size,
             self.cfg.view.depth_scale,
+            world_radius,
         ))
         .expect("init renderer");
         self.renderer = Some(renderer);
@@ -259,9 +271,10 @@ impl ApplicationHandler for App {
                 self.build_instances();
                 let aspect = self.renderer.as_ref().unwrap().aspect();
                 let view_proj = self.camera.view_proj(aspect);
+                let proj_xy = self.camera.proj_scale(aspect);
                 let count = self.instances_scratch.len() as u32;
                 let r = self.renderer.as_mut().unwrap();
-                r.update_camera(view_proj);
+                r.update_camera(view_proj, proj_xy);
                 r.update_instances(&self.instances_scratch);
                 match r.render(count) {
                     Ok(()) => {}
