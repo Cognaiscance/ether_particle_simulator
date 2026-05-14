@@ -17,9 +17,11 @@ impl OrbitCamera {
     pub fn looking_at_box(box_min: Vec3, box_max: Vec3) -> Self {
         let center = 0.5 * (box_min + box_max);
         let extent = (box_max - box_min).length();
-        let radius = extent * 1.4;
-        let yaw = std::f32::consts::FRAC_PI_4;
-        let pitch = std::f32::consts::FRAC_PI_6;
+        // Look straight at the widest face. For an elongated box (x is the long
+        // axis here) that means looking along Z at the X-Y face.
+        let radius = extent * 0.55;
+        let yaw = 0.0;
+        let pitch = 0.0;
         Self {
             target: center,
             radius,

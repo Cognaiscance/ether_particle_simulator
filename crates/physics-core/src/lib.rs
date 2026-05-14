@@ -76,10 +76,98 @@ pub struct SimulationParams {
     pub domain: Domain,
 }
 
+/// A free-moving rigid sphere that interacts with the small particles. Currently linear
+/// only — no orientation, angular velocity, or friction.
+#[derive(Clone, Copy, Debug)]
+pub struct RigidBody {
+    pub pos: Vec3,
+    pub vel: Vec3,
+    pub radius: f32,
+    pub mass: f32,
+    /// `1.0 / mass`, cached. `0.0` means immovable (infinite mass).
+    pub inv_mass: f32,
+}
+
+impl RigidBody {
+    pub fn new(pos: Vec3, vel: Vec3, radius: f32, mass: f32) -> Self {
+        let inv_mass = if mass.is_finite() && mass > 0.0 { 1.0 / mass } else { 0.0 };
+        Self { pos, vel, radius, mass, inv_mass }
+    }
+}
+
+/// Hollow cylindrical cannon with an annular muzzle lip and a kinematic piston.
+///
+/// Geometry is anchored at `origin` (center of the back face) and oriented along
+/// the unit vector `axis`. Local axial coordinate `s` is the projection of
+/// `(p - origin)` onto `axis`; local radial distance `rho` is the length of the
+/// component perpendicular to `axis`. The body is a thick-walled tube:
+///
+/// - inner bore at `rho = bore_radius`, axial extent `s ∈ [0, length]`
+/// - outer surface at `rho = lip_outer_radius`, same axial extent
+/// - annular back face at `s = 0`, `rho ∈ [bore_radius, lip_outer_radius]`
+/// - annular front lip at `s = length`, `rho ∈ [bore_radius, lip_outer_radius]`
+/// - piston disk inside the bore at `s = piston_offset(t)`
+///
+/// The piston follows `p(t) = stroke · (1 − cos(2π t / period)) / 2` for one
+/// cycle, then rests at zero. Peak axial velocity is `stroke · π / period`.
+#[derive(Clone, Debug)]
+pub struct Cannon {
+    pub origin: Vec3,
+    pub axis: Vec3,
+    pub length: f32,
+    pub bore_radius: f32,
+    pub lip_outer_radius: f32,
+    pub piston_stroke: f32,
+    pub piston_period: f32,
+    pub elapsed: f32,
+    pub piston_offset: f32,
+    pub piston_vel: f32,
+}
+
+impl Cannon {
+    pub fn new(
+        origin: Vec3,
+        axis: Vec3,
+        length: f32,
+        bore_radius: f32,
+        lip_outer_radius: f32,
+        piston_stroke: f32,
+        piston_period: f32,
+    ) -> Self {
+        let axis = axis.normalize_or_zero();
+        Self {
+            origin,
+            axis,
+            length,
+            bore_radius,
+            lip_outer_radius,
+            piston_stroke,
+            piston_period,
+            elapsed: 0.0,
+            piston_offset: 0.0,
+            piston_vel: 0.0,
+        }
+    }
+
+    fn advance(&mut self, dt: f32) {
+        self.elapsed += dt;
+        if self.piston_period <= 0.0 || self.elapsed >= self.piston_period {
+            self.piston_offset = 0.0;
+            self.piston_vel = 0.0;
+            return;
+        }
+        let phase = std::f32::consts::TAU * self.elapsed / self.piston_period;
+        self.piston_offset = self.piston_stroke * (1.0 - phase.cos()) * 0.5;
+        self.piston_vel = self.piston_stroke * std::f32::consts::PI / self.piston_period * phase.sin();
+    }
+}
+
 pub struct Simulation {
     pub params: SimulationParams,
     pub positions: Vec<Vec3>,
     pub velocities: Vec<Vec3>,
+    pub bodies: Vec<RigidBody>,
+    pub cannons: Vec<Cannon>,
     grid: HashGrid,
 }
 
@@ -87,7 +175,15 @@ impl Simulation {
     pub fn new(params: SimulationParams, positions: Vec<Vec3>, velocities: Vec<Vec3>) -> Self {
         assert_eq!(positions.len(), velocities.len());
         let grid = HashGrid::new(2.0 * params.radius);
-        Self { params, positions, velocities, grid }
+        Self { params, positions, velocities, bodies: Vec::new(), cannons: Vec::new(), grid }
+    }
+
+    pub fn add_body(&mut self, body: RigidBody) {
+        self.bodies.push(body);
+    }
+
+    pub fn add_cannon(&mut self, cannon: Cannon) {
+        self.cannons.push(cannon);
     }
 
     pub fn len(&self) -> usize {
@@ -100,13 +196,26 @@ impl Simulation {
 
     pub fn step(&mut self, dt: f32) {
         self.integrate(dt);
+        self.integrate_bodies(dt);
+        for c in self.cannons.iter_mut() {
+            c.advance(dt);
+        }
         self.resolve_walls();
+        self.resolve_body_walls();
+        self.resolve_cannons();
         self.resolve_pairs();
+        self.resolve_body_particles();
     }
 
     fn integrate(&mut self, dt: f32) {
         for (p, v) in self.positions.iter_mut().zip(self.velocities.iter()) {
             *p += *v * dt;
+        }
+    }
+
+    fn integrate_bodies(&mut self, dt: f32) {
+        for body in self.bodies.iter_mut() {
+            body.pos += body.vel * dt;
         }
     }
 
@@ -146,6 +255,119 @@ impl Simulation {
                             *v -= 2.0 * v_rad * n_hat;
                         }
                     }
+                }
+            }
+        }
+    }
+
+    fn resolve_body_walls(&mut self) {
+        let domain = self.params.domain;
+        for body in self.bodies.iter_mut() {
+            let r = body.radius;
+            match domain {
+                Domain::Box { min, max } => {
+                    let lo = min + Vec3::splat(r);
+                    let hi = max - Vec3::splat(r);
+                    for axis in 0..3 {
+                        if body.pos[axis] < lo[axis] {
+                            body.pos[axis] = lo[axis] + (lo[axis] - body.pos[axis]);
+                            body.vel[axis] = -body.vel[axis];
+                        } else if body.pos[axis] > hi[axis] {
+                            body.pos[axis] = hi[axis] - (body.pos[axis] - hi[axis]);
+                            body.vel[axis] = -body.vel[axis];
+                        }
+                    }
+                }
+                Domain::Sphere { center, radius } => {
+                    let inner = radius - r;
+                    if inner <= 0.0 { continue; }
+                    let offset = body.pos - center;
+                    let d_sq = offset.length_squared();
+                    if d_sq > inner * inner && d_sq > 1e-12 {
+                        let d = d_sq.sqrt();
+                        let n_hat = offset / d;
+                        body.pos -= n_hat * (2.0 * (d - inner));
+                        let v_rad = body.vel.dot(n_hat);
+                        if v_rad > 0.0 {
+                            body.vel -= 2.0 * v_rad * n_hat;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn resolve_cannons(&mut self) {
+        if self.cannons.is_empty() {
+            return;
+        }
+        let r_p = self.params.radius;
+        for cannon in self.cannons.iter() {
+            for i in 0..self.positions.len() {
+                resolve_particle_against_cannon(
+                    &mut self.positions[i],
+                    &mut self.velocities[i],
+                    r_p,
+                    cannon,
+                );
+            }
+        }
+    }
+
+    fn resolve_body_particles(&mut self) {
+        if self.bodies.is_empty() {
+            return;
+        }
+        let part_r = self.params.radius;
+        let part_m = self.params.mass;
+        let inv_m_p = if part_m > 0.0 { 1.0 / part_m } else { 0.0 };
+
+        // Grid must reflect post-pair positions (resolve_pairs may have nudged particles).
+        self.grid.rebuild(&self.positions);
+
+        for bi in 0..self.bodies.len() {
+            let body = self.bodies[bi];
+            let body_r = body.radius;
+            let min_dist = body_r + part_r;
+            let min_dist_sq = min_dist * min_dist;
+            let pad = Vec3::splat(min_dist);
+            let aabb_lo = body.pos - pad;
+            let aabb_hi = body.pos + pad;
+
+            // Collect particles that share at least one cell with the body's AABB. The
+            // closure can't mutate `self`, so we materialise the candidate list first.
+            let mut candidates: Vec<usize> = Vec::new();
+            self.grid.for_each_in_aabb(aabb_lo, aabb_hi, |j| candidates.push(j));
+
+            for &j in &candidates {
+                let delta = self.positions[j] - self.bodies[bi].pos;
+                let d_sq = delta.length_squared();
+                if d_sq >= min_dist_sq || d_sq < 1e-12 {
+                    continue;
+                }
+                let d = d_sq.sqrt();
+                let n_hat = delta / d;
+                let v_rel = self.velocities[j] - self.bodies[bi].vel;
+                let v_rel_n = v_rel.dot(n_hat);
+                let denom = inv_m_p + self.bodies[bi].inv_mass;
+                if denom <= 0.0 {
+                    continue; // both static; nothing to do
+                }
+                let inv_m_b = self.bodies[bi].inv_mass;
+                if v_rel_n < 0.0 {
+                    // Elastic impulse along n_hat. Pushes particle outward, body inward
+                    // (each scaled by its inverse mass).
+                    let imp = -2.0 * v_rel_n / denom;
+                    self.velocities[j] += (imp * inv_m_p) * n_hat;
+                    self.bodies[bi].vel -= (imp * inv_m_b) * n_hat;
+                }
+                // Inverse-mass-weighted positional de-overlap.
+                let overlap = min_dist - d;
+                if overlap > 0.0 {
+                    let part_share = inv_m_p / denom;
+                    let body_share = inv_m_b / denom;
+                    self.positions[j] += (overlap * part_share) * n_hat;
+                    self.bodies[bi].pos -= (overlap * body_share) * n_hat;
                 }
             }
         }
@@ -215,6 +437,99 @@ impl Simulation {
     pub fn momentum(&self) -> Vec3 {
         let m = self.params.mass;
         self.velocities.iter().copied().sum::<Vec3>() * m
+    }
+}
+
+/// Resolve a single particle against the surfaces of `cannon`. Pushes the particle
+/// out of any overlap and reflects the relevant velocity component (radial for the
+/// cylindrical walls, axial for the annuli and piston). The piston is treated as a
+/// moving wall: `v' = 2·v_piston - v` for the axial component.
+fn resolve_particle_against_cannon(pos: &mut Vec3, vel: &mut Vec3, r_p: f32, c: &Cannon) {
+    // Helper: decompose a position into (axial, radial_vec, rho, rho_hat).
+    let axial_radial = |p: Vec3| {
+        let to_p = p - c.origin;
+        let s = to_p.dot(c.axis);
+        let radial_vec = to_p - c.axis * s;
+        let rho = radial_vec.length();
+        (s, radial_vec, rho)
+    };
+
+    let bore = c.bore_radius;
+    let outer = c.lip_outer_radius;
+    let length = c.length;
+    let s_pist = c.piston_offset;
+
+    // 1) Inner bore wall: cylinder at rho = bore, axial extent [0, length], two-sided.
+    let (s, radial_vec, rho) = axial_radial(*pos);
+    if s > -r_p && s < length + r_p && rho > 1e-6 {
+        let rho_hat = radial_vec / rho;
+        let d = rho - bore;
+        if d.abs() < r_p {
+            let target_rho = if d >= 0.0 { bore + r_p } else { bore - r_p };
+            *pos += rho_hat * (target_rho - rho);
+            let v_radial = vel.dot(rho_hat);
+            // Reflect only if moving into the wall.
+            if (d >= 0.0 && v_radial < 0.0) || (d < 0.0 && v_radial > 0.0) {
+                *vel -= 2.0 * v_radial * rho_hat;
+            }
+        }
+    }
+
+    // 2) Outer wall: cylinder at rho = outer, axial extent [0, length], two-sided.
+    let (s, radial_vec, rho) = axial_radial(*pos);
+    if s > -r_p && s < length + r_p && rho > 1e-6 {
+        let rho_hat = radial_vec / rho;
+        let d = rho - outer;
+        if d.abs() < r_p {
+            let target_rho = if d >= 0.0 { outer + r_p } else { outer - r_p };
+            *pos += rho_hat * (target_rho - rho);
+            let v_radial = vel.dot(rho_hat);
+            if (d >= 0.0 && v_radial < 0.0) || (d < 0.0 && v_radial > 0.0) {
+                *vel -= 2.0 * v_radial * rho_hat;
+            }
+        }
+    }
+
+    // 3) Front lip annulus at s = length, rho in [bore, outer], two-sided.
+    let (s, _, rho) = axial_radial(*pos);
+    if rho >= bore && rho <= outer {
+        let d = s - length;
+        if d.abs() < r_p {
+            let target_s = if d >= 0.0 { length + r_p } else { length - r_p };
+            *pos += c.axis * (target_s - s);
+            let v_axial = vel.dot(c.axis);
+            if (d >= 0.0 && v_axial < 0.0) || (d < 0.0 && v_axial > 0.0) {
+                *vel -= 2.0 * v_axial * c.axis;
+            }
+        }
+    }
+
+    // 4) Back annulus at s = 0, rho in [bore, outer], two-sided.
+    let (s, _, rho) = axial_radial(*pos);
+    if rho >= bore && rho <= outer {
+        if s.abs() < r_p {
+            let target_s = if s >= 0.0 { r_p } else { -r_p };
+            *pos += c.axis * (target_s - s);
+            let v_axial = vel.dot(c.axis);
+            if (s >= 0.0 && v_axial < 0.0) || (s < 0.0 && v_axial > 0.0) {
+                *vel -= 2.0 * v_axial * c.axis;
+            }
+        }
+    }
+
+    // 5) Piston disk at s = piston_offset, rho < bore. One-sided: particle's center
+    // must stay at s >= piston_offset + r_p within the bore.
+    let (s, _, rho) = axial_radial(*pos);
+    if rho < bore && s < s_pist + r_p {
+        let target_s = s_pist + r_p;
+        *pos += c.axis * (target_s - s);
+        let v_axial = vel.dot(c.axis);
+        // Elastic collision with a wall moving at piston velocity. Only apply when
+        // the particle is closing on the piston (relative velocity < 0).
+        if v_axial < c.piston_vel {
+            let v_new = 2.0 * c.piston_vel - v_axial;
+            *vel += (v_new - v_axial) * c.axis;
+        }
     }
 }
 
@@ -397,6 +712,56 @@ mod tests {
         assert!(
             (p1 - p0).length() < 1e-3,
             "momentum not conserved across pair collisions: {} -> {}", p0, p1
+        );
+    }
+
+    #[test]
+    fn body_particle_collision_conserves_energy_and_momentum() {
+        // Body and particles share a large box (walls won't interfere over the test interval).
+        let params = SimulationParams {
+            radius: 0.05,
+            mass: 1.0,
+            domain: Domain::Box { min: Vec3::splat(-50.0), max: Vec3::splat(50.0) },
+        };
+        let small_params = SimulationParams {
+            domain: Domain::Box { min: Vec3::splat(-0.5), max: Vec3::splat(0.5) },
+            ..params
+        };
+        let (positions, velocities) = init_random_uniform_speed(20, small_params, 1.0, 9).unwrap();
+        let mut sim = Simulation::new(params, positions, velocities);
+        // Heavy-but-finite body so it actually exchanges energy with the particles.
+        sim.add_body(RigidBody::new(
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(-1.5, 0.0, 0.0),
+            0.3,
+            50.0,
+        ));
+
+        let total_energy = |s: &Simulation| {
+            let part = s.kinetic_energy();
+            let body: f32 = s.bodies.iter().map(|b| 0.5 * b.mass * b.vel.length_squared()).sum();
+            part + body
+        };
+        let total_momentum = |s: &Simulation| {
+            let part = s.momentum();
+            let body: Vec3 = s.bodies.iter().map(|b| b.mass * b.vel).sum();
+            part + body
+        };
+
+        let e0 = total_energy(&sim);
+        let p0 = total_momentum(&sim);
+        for _ in 0..2000 {
+            sim.step(0.005);
+        }
+        let e1 = total_energy(&sim);
+        let p1 = total_momentum(&sim);
+        assert!(
+            (e1 - e0).abs() / e0 < 1e-2,
+            "energy not conserved with body: {} -> {}", e0, e1,
+        );
+        assert!(
+            (p1 - p0).length() < 1e-2,
+            "momentum not conserved with body: {} -> {}", p0, p1,
         );
     }
 

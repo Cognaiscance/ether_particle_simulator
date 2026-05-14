@@ -1,0 +1,45 @@
+[particles]
+count = 800000
+radius = 0.03
+mass = 1.0
+# Quiescent medium.
+speed = 0.1
+
+[box]
+min = [0.0, 0.0, 0.0]
+max = [20.0, 6.0, 6.0]
+
+[sim]
+# Piston peak vel ≈ stroke·π/period = 1.5·π/0.7 ≈ 6.7. Per-step travel at dt=0.003
+# is ≈ 0.02, well under particle radius 0.03 → no tunneling.
+dt = 0.003
+steps = 6000
+seed = 42
+report_every = 200
+
+# Thick-walled cannon body, axis +x, back at x=3, muzzle at x=5. L/D = 1.5/1.0 = 1.5
+# (above the ~1 threshold for vortex-ring roll-up). Lip extends to radius 1.5 to
+# give a clean shear edge ringing the orifice.
+[[cannons]]
+origin = [3.0, 3.0, 3.0]
+axis = [1.0, 0.0, 0.0]
+length = 2.0
+bore_radius = 0.5
+lip_outer_radius = 1.5
+piston_stroke = 1.5
+piston_period = 0.7
+
+[view]
+particle_pixel_size = 2.5
+color_mode = "velocity"
+subsample = 1
+color = [0.95, 0.55, 0.15]
+depth_scale = 0.3
+render_at_physical_size = false
+
+# Slice through the cannon axis: shows the toroidal ring as two counter-rotating
+# lobes in the x-y plane.
+[view.slice]
+axis = "z"
+min = 2.7
+max = 3.3

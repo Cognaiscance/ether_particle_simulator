@@ -88,6 +88,28 @@ impl HashGrid {
         }
     }
 
+    /// Call `f` once for every particle whose cell overlaps the world-space AABB `[lo, hi]`.
+    /// Used for queries by large objects (e.g. rigid bodies) that may span many cells.
+    pub fn for_each_in_aabb<F: FnMut(usize)>(&self, lo: Vec3, hi: Vec3, mut f: F) {
+        let c_lo = cell_coord_of(lo, self.inv_cell_size);
+        let c_hi = cell_coord_of(hi, self.inv_cell_size);
+        for cz in c_lo[2]..=c_hi[2] {
+            for cy in c_lo[1]..=c_hi[1] {
+                for cx in c_lo[0]..=c_hi[0] {
+                    let cid = pack_cell([cx, cy, cz]);
+                    let b = (hash64(cid) & self.table_mask) as usize;
+                    let start = self.cell_starts[b] as usize;
+                    let end = self.cell_starts[b + 1] as usize;
+                    for k in start..end {
+                        if self.cell_ids[k] == cid {
+                            f(self.indices[k] as usize);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Call `f` once for every particle whose cell lies in the 3x3x3 neighborhood of `p`.
     /// May yield the particle at `p` itself; callers must filter if that matters.
     pub fn for_each_neighbor<F: FnMut(usize)>(&self, p: Vec3, mut f: F) {

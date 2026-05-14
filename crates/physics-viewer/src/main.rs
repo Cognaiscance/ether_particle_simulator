@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use glam::Vec3;
-use physics_core::{init_random_uniform_speed, Domain, Simulation, SimulationParams};
+use physics_core::{init_random_uniform_speed, Cannon, Domain, RigidBody, Simulation, SimulationParams};
 use serde::Deserialize;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
@@ -27,7 +27,50 @@ struct Config {
     sim: SimConfig,
     #[serde(default)]
     view: ViewConfig,
+    #[serde(default)]
+    bodies: Vec<BodyConfig>,
+    #[serde(default)]
+    slug: Option<SlugConfig>,
+    #[serde(default)]
+    cannons: Vec<CannonConfig>,
 }
+
+#[derive(Deserialize)]
+struct CannonConfig {
+    origin: [f32; 3],
+    axis: [f32; 3],
+    length: f32,
+    bore_radius: f32,
+    lip_outer_radius: f32,
+    piston_stroke: f32,
+    piston_period: f32,
+}
+
+/// A cylindrical region whose particles are launched with a uniform directed velocity.
+/// Used to seed a vortex-cannon-style ejection without needing piston geometry.
+#[derive(Deserialize)]
+struct SlugConfig {
+    center: [f32; 3],
+    axis: [f32; 3],
+    radius: f32,
+    length: f32,
+    speed: f32,
+}
+
+#[derive(Deserialize)]
+struct BodyConfig {
+    pos: [f32; 3],
+    #[serde(default)]
+    vel: [f32; 3],
+    radius: f32,
+    mass: f32,
+    /// Render color for this body. Defaults to a neutral gray so it visually
+    /// distinguishes from the warm particle color ramp.
+    #[serde(default = "default_body_color")]
+    color: [f32; 3],
+}
+
+fn default_body_color() -> [f32; 3] { [0.7, 0.75, 0.85] }
 
 #[derive(Deserialize)]
 struct ParticlesConfig {
@@ -171,11 +214,47 @@ impl App {
             cfg.sim.seed,
         )
         .ok_or_else(|| anyhow!("could not place {} particles without overlap", cfg.particles.count))?;
-        let sim = Simulation::new(params, positions, velocities);
+        let mut sim = Simulation::new(params, positions, velocities);
+        for b in &cfg.bodies {
+            sim.add_body(RigidBody::new(
+                Vec3::from_array(b.pos),
+                Vec3::from_array(b.vel),
+                b.radius,
+                b.mass,
+            ));
+        }
+        for c in &cfg.cannons {
+            sim.add_cannon(Cannon::new(
+                Vec3::from_array(c.origin),
+                Vec3::from_array(c.axis),
+                c.length,
+                c.bore_radius,
+                c.lip_outer_radius,
+                c.piston_stroke,
+                c.piston_period,
+            ));
+        }
+        if let Some(s) = &cfg.slug {
+            let center = Vec3::from_array(s.center);
+            let axis_unit = Vec3::from_array(s.axis).normalize_or_zero();
+            let half_l = s.length * 0.5;
+            let r2 = s.radius * s.radius;
+            for (p, v) in sim.positions.iter().zip(sim.velocities.iter_mut()) {
+                let rel = *p - center;
+                let along = rel.dot(axis_unit);
+                if along.abs() > half_l { continue; }
+                let radial2 = (rel - axis_unit * along).length_squared();
+                if radial2 > r2 { continue; }
+                *v = axis_unit * s.speed;
+            }
+        }
+        // Color scale: if a slug is present, normalize by its (much higher) speed so
+        // the quiescent medium and the slug span the cool/warm gradient meaningfully.
+        let speed_for_color = cfg.slug.as_ref().map(|s| s.speed).unwrap_or(cfg.particles.speed);
         let (aabb_min, aabb_max) = params.domain.aabb();
         let camera = OrbitCamera::looking_at_box(aabb_min, aabb_max);
         Ok(Self {
-            speed_for_color: cfg.particles.speed,
+            speed_for_color,
             cfg,
             sim,
             camera,
@@ -194,6 +273,13 @@ impl App {
         let warm = self.cfg.view.color;
         // Speed scale for velocity coloring: half/double the initial speed bracket roughly maps 0..1.
         let scale = self.speed_for_color.max(1e-6);
+        // Particles render either in screen-pixel mode (`world_radius = 0`) or world-space
+        // mode where each dot is a billboard the size of its physics collision sphere.
+        let particle_world_radius = if self.cfg.view.render_at_physical_size {
+            self.sim.params.radius
+        } else {
+            0.0
+        };
 
         for i in (0..n).step_by(sub) {
             let p = self.sim.positions[i];
@@ -211,7 +297,21 @@ impl App {
                 ColorMode::Uniform => warm,
                 ColorMode::Velocity => velocity_color(self.sim.velocities[i].length() / scale, warm),
             };
-            self.instances_scratch.push(Instance { pos: [p.x, p.y, p.z], color });
+            self.instances_scratch.push(Instance {
+                pos: [p.x, p.y, p.z],
+                color,
+                world_radius: particle_world_radius,
+            });
+        }
+
+        // Rigid bodies render as world-space billboards regardless of the global flag,
+        // since their radius is per-body. Per-body colour comes from config.
+        for (body, cfg_body) in self.sim.bodies.iter().zip(self.cfg.bodies.iter()) {
+            self.instances_scratch.push(Instance {
+                pos: [body.pos.x, body.pos.y, body.pos.z],
+                color: cfg_body.color,
+                world_radius: body.radius,
+            });
         }
     }
 }
@@ -240,16 +340,10 @@ impl ApplicationHandler for App {
                 .create_window(attrs)
                 .expect("create window"),
         );
-        let world_radius = if self.cfg.view.render_at_physical_size {
-            Some(self.cfg.particles.radius)
-        } else {
-            None
-        };
         let renderer = pollster::block_on(Renderer::new(
             window.clone(),
             self.cfg.view.particle_pixel_size,
             self.cfg.view.depth_scale,
-            world_radius,
         ))
         .expect("init renderer");
         self.renderer = Some(renderer);
@@ -293,9 +387,14 @@ impl ApplicationHandler for App {
                 let view_proj = self.camera.view_proj(aspect);
                 let proj_xy = self.camera.proj_scale(aspect);
                 let count = self.instances_scratch.len() as u32;
+                let status = match self.sim.bodies.first() {
+                    Some(b) => format!("ball |v| = {:.2}", b.vel.length()),
+                    None => String::new(),
+                };
                 let r = self.renderer.as_mut().unwrap();
                 r.update_camera(view_proj, proj_xy);
                 r.update_instances(&self.instances_scratch);
+                r.set_status_text(status);
                 match r.render(count) {
                     Ok(()) => {}
                     Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
